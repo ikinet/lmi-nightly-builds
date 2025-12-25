@@ -25,6 +25,7 @@ jobs:
           mkdir -p ~/.local/bin
           ln -s "$PWD/pmbootstrap/pmbootstrap.py" ~/.local/bin/pmbootstrap
           pmbootstrap --version
+          
 
       - name: Set up pmaports
         run: |
@@ -48,6 +49,14 @@ jobs:
           shopt -s expand_aliases
           source ../pmbootstrap/helpers/envkernel.sh
           make defconfig sm8250.config
+      - name: Disable SMB client to fix wcslen linker error
+        run: |
+          cd linux
+          # 禁用 CONFIG_CIFS
+          ./scripts/config --disable CIFS
+      - name: Build kernel
+        run: |
+          cd linux
           make -j$(nproc)
           pmbootstrap build --envkernel linux-postmarketos-qcom-sm8250-lmi
 
