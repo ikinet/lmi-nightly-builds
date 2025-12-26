@@ -48,9 +48,7 @@ jobs:
           cd linux
           shopt -s expand_aliases
           source ../pmbootstrap/helpers/envkernel.sh
-          make mrproper
           make defconfig sm8250.config
-          ./scripts/config --disable CIFS
           make -j$(nproc)
           pmbootstrap build --envkernel linux-postmarketos-qcom-sm8250-lmi
 
