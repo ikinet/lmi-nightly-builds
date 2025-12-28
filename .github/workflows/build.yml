@@ -1,72 +1,157 @@
-name: Build images
+name: Build Debian-Ready Kernel
+
 on:
   push:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 5' # Run every friday at midnight
+    - cron: '0 0 * * 5'
 
 env:
-  KERNEL_BRANCH: 6.12.1
+  KERNEL_BRANCH: nikroks/alioth  # 你的内核分支
+  DEVICE_CONFIG: xiaomi-lmi.cfg
 
 jobs:
-  build-image:
+  build-kernel:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out build configurations
+      - name: Checkout build tools
         uses: actions/checkout@v4
 
-      - name: Substitute placeholders in configs
+      - name: Install dependencies
         run: |
-          find . -type f -name "*.cfg" -exec sed -i "s|HOME|$(echo $HOME)|;s|NPROC|$(nproc)|" {} +
+          sudo apt update
+          sudo apt install -y git qemu-user-static debootstrap device-tree-compiler
 
-      - name: Install pmbootstrap from git
+      - name: Install pmbootstrap
         run: |
           git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
           mkdir -p ~/.local/bin
           ln -s "$PWD/pmbootstrap/pmbootstrap.py" ~/.local/bin/pmbootstrap
-          pmbootstrap --version
-          
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Set up pmaports
+      - name: Initialize pmbootstrap environment
         run: |
           echo -e '\n\n' | pmbootstrap init || true
           cd ~/.local/var/pmbootstrap/cache_git/pmaports
-          git remote add mainlining https://github.com/ikinet/pmaports.git
-          git fetch mainlining nikroks/alioth
-          git reset --hard mainlining/nikroks/alioth
+          git remote add custom https://github.com/ikinet/pmaports.git
+          git fetch custom nikroks/alioth
+          git reset --hard custom/nikroks/alioth
 
-      - name: Clone kernel sources
+      - name: Clone kernel source
         run: |
-          git clone https://github.com/ikinet/linux.git --single-branch --branch nikroks/alioth --depth 1 ./linux
+          git clone https://github.com/ikinet/linux.git \
+            --single-branch --branch ${{ env.KERNEL_BRANCH }} --depth 1 \
+            ~/.local/var/pmbootstrap/chroot_native/home/user/linux
 
-      - name: Choose any SM8250 device in pmbootstrap to build kernel
+      - name: Compile kernel for Debian
         run: |
-          cp xiaomi-lmi.cfg ~/.config/pmbootstrap_v3.cfg
-
-      - name: Compile kernel with envkernel
-        run: |
-          cd linux
-          shopt -s expand_aliases
-          source ../pmbootstrap/helpers/envkernel.sh
+          cd ~/.local/var/pmbootstrap/chroot_native/home/user/linux
+          source ~/pmbootstrap/helpers/envkernel.sh
           make defconfig sm8250.config
-          make -j$(nproc)
-          pmbootstrap build --envkernel linux-postmarketos-qcom-sm8250-lmi
+          
+          # 确保关键选项编译进内核（非模块）
+          scripts/config -e CONFIG_USB
+          scripts/config -e CONFIG_USB_XHCI_HCD
+          scripts/config -e CONFIG_USB_EHCI_HCD
+          scripts/config -e CONFIG_USB_DWC3
+          scripts/config -e CONFIG_USB_DWC3_QCOM
+          
+          # 编译内核和设备树
+          make -j$(nproc) Image dtbs
+          
+          # 安装模块到临时目录
+          make INSTALL_MOD_PATH=/tmp/kernel-modules modules_install
+          
+          # 创建 modules.dep
+          sudo depmod -b /tmp/kernel-modules -F System.map $(make kernelrelease)
 
-      - name: Create artifact directory
+      - name: Modify device tree for USB host mode
         run: |
-          mkdir out
+          cd ~/.local/var/pmbootstrap/chroot_native/home/user/linux
+          
+          # 反编译设备树
+          dtc -I dtb -O dts \
+            arch/arm64/boot/dts/qcom/sm8250-xiaomi-lmi.dtb \
+            -o /tmp/sm8250-lmi.dts
+          
+          # 修改 USB 配置
+          sed -i 's/dr_mode = "peripheral";/dr_mode = "host";/' /tmp/sm8250-lmi.dts
+          sed -i '/postmarketos,usb-gadget/d' /tmp/sm8250-lmi.dts
+          
+          # 重新编译
+          dtc -I dts -O dtb -o /tmp/sm8250-xiaomi-lmi-host.dtb /tmp/sm8250-lmi.dts
 
-      - name: Build xiaomi-lmi
+      - name: Package Debian installation files
         run: |
-          cp xiaomi-lmi.cfg ~/.config/pmbootstrap_v3.cfg
-          pmbootstrap install --password 147147
-          pmbootstrap export
-          cp /tmp/postmarketOS-export/boot.img out/boot-xiaomi-lmi.img
-          cp /tmp/postmarketOS-export/xiaomi-lmi.img out/rootfs-xiaomi-lmi.img
+          mkdir -p /tmp/debian-kernel/{boot,lib,firmware,scripts}
+          cd ~/.local/var/pmbootstrap/chroot_native/home/user/linux
+          
+          # 复制内核
+          cp arch/arm64/boot/Image /tmp/debian-kernel/boot/vmlinuz-6.13.0-sm8250
+          
+          # 复制设备树
+          cp /tmp/sm8250-xiaomi-lmi-host.dtb \
+             /tmp/debian-kernel/boot/
+          
+          # 复制模块
+          cp -r /tmp/kernel-modules/lib/modules/* /tmp/debian-kernel/lib/modules/
+          
+          # 复制固件（从 postmarketOS 提取）
+          if [ -d ~/.local/var/pmbootstrap/chroot_rootfs_aarch64/lib/firmware ]; then
+            cp -r ~/.local/var/pmbootstrap/chroot_rootfs_aarch64/lib/firmware/* \
+              /tmp/debian-kernel/firmware/ 2>/dev/null || true
+          fi
+          
+          # 创建一键安装脚本
+          cat > /tmp/debian-kernel/install.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "Installing kernel 6.13.0-sm8250 for Debian..."
+          
+          # 备份旧内核
+          [ -f /boot/vmlinuz-6.13.0-sm8250 ] && cp /boot/vmlinuz-6.13.0-sm8250 /boot/vmlinuz-6.13.0-sm8250.bak
+          
+          # 安装内核
+          sudo cp boot/vmlinuz-6.13.0-sm8250 /boot/
+          sudo cp boot/sm8250-xiaomi-lmi-host.dtb /boot/dtb-6.13.0-sm8250/qcom/
+          
+          # 安装模块
+          sudo rm -rf /lib/modules/6.13.0-sm8250
+          sudo cp -r lib/modules/6.13.0-sm8250 /lib/modules/
+          
+          # 安装固件
+          sudo cp -r firmware/* /lib/firmware/ 2>/dev/null || true
+          
+          # 更新模块依赖
+          sudo depmod -a 6.13.0-sm8250
+          
+          # 生成 initramfs
+          sudo update-initramfs -c -k 6.13.0-sm8250
+          
+          # 更新引导（如果有 grub/u-boot）
+          [ -x /usr/sbin/update-grub ] && sudo update-grub || true
+          
+          echo "Installation complete! Please reboot."
+          echo "After reboot, run: lsusb && dmesg | grep dwc3"
+          EOF
+          
+          chmod +x /tmp/debian-kernel/install.sh
+          
+          # 创建归档
+          cd /tmp
+          tar -czf debian-kernel-6.13.0-sm8250.tar.gz debian-kernel
 
-      - name: Upload artifacts
+      - name: Upload kernel files
         uses: actions/upload-artifact@v4
         with:
-          name: xiaomi-lmi
-          path: out/*-lmi.img*
-          retention-days: 7
+          name: debian-kernel-6.13.0-sm8250
+          path: /tmp/debian-kernel-6.13.0-sm8250.tar.gz
+          retention-days: 30
+
+      - name: Upload individual components
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-modules-6.13.0-sm8250
+          path: /tmp/kernel-modules/lib/modules/6.13.0-sm8250
+          retention-days: 30
