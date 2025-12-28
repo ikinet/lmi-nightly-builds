@@ -46,7 +46,7 @@ jobs:
       - name: Compile kernel for Debian
         run: |
           cd ~/.local/var/pmbootstrap/chroot_native/home/user/linux
-          source ~/pmbootstrap/helpers/envkernel.sh
+          source $PWD/pmbootstrap/helpers/envkernel.sh
           make defconfig sm8250.config
           
           # 确保关键选项编译进内核（非模块）
